@@ -225,6 +225,14 @@ class LiveTrader:
         if prev_candle is None or curr_candle is None:
             return None
         
+        # Verify the candle is from today
+        candle_date = curr_candle['timestamp'].date() if hasattr(curr_candle['timestamp'], 'date') else None
+        today = datetime.now().date()
+        
+        if candle_date and candle_date != today:
+            self.trading_logger.log_pin_bar_result(False, False, False, 0, f"candle from {candle_date}, not today")
+            return None
+        
         # Calculate pin bar metrics for logging
         rng = curr_candle['high'] - curr_candle['low'] if curr_candle['high'] != curr_candle['low'] else 1
         lower_wick_pct = ((min(curr_candle['open'], curr_candle['close']) - curr_candle['low']) / rng) * 100
@@ -264,6 +272,12 @@ class LiveTrader:
         self.trading_logger.log_pin_bar_result(is_valid, in_window, above_ema, lower_wick_pct, reason)
         
         if trade:
+            # Verify trade is for today
+            trade_date = trade.entry_time.date() if hasattr(trade.entry_time, 'date') else None
+            if trade_date and trade_date != today:
+                self.logger.info(f"Ignoring signal from {trade_date}, not today")
+                return None
+            
             # Check if this is a new signal (not the same candle as before)
             if self.last_signal_time == trade.entry_time:
                 self.logger.debug("Signal already processed for this candle")
