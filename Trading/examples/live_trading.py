@@ -199,11 +199,10 @@ class LiveTrader:
             
             if df is None or df.empty:
                 self.logger.warning("No candle data received")
-                self.trading_logger.log_error("No candle data received from API")
+                self.trading_logger.log_error("No data from API")
                 return None
             
             self.logger.debug(f"Fetched {len(df)} candles, latest: {df.iloc[-1]['timestamp']}")
-            self.trading_logger.log_candles_fetched(df, len(df))
             return df
             
         except Exception as e:
@@ -218,43 +217,58 @@ class LiveTrader:
             Trade object if signal detected, None otherwise.
         """
         if df is None or len(df) < 3:
-            self.trading_logger.log_decision(False, "Insufficient candles (need at least 3)")
             return None
         
-        # Get the candles for analysis (excluding the forming candle)
-        df_sorted = df.sort_values("timestamp").reset_index(drop=True)
-        prev_candle = df_sorted.iloc[-3].to_dict()
-        curr_candle = df_sorted.iloc[-2].to_dict()
+        # Log candle check and get candle data
+        prev_candle, curr_candle = self.trading_logger.log_candle_check(df)
         
-        # Calculate EMA if available
-        ema_value = None
-        if self.strategy.use_ema_filter:
-            df_with_ema = df_sorted.copy()
-            df_with_ema['ema_7'] = df_with_ema['close'].ewm(span=7, adjust=False).mean()
-            ema_value = df_with_ema.iloc[-2]['ema_7']
+        if prev_candle is None or curr_candle is None:
+            return None
         
-        # Log detailed analysis
-        is_pin_bar = self.trading_logger.log_pin_bar_analysis(prev_candle, curr_candle, ema_value)
+        # Calculate pin bar metrics for logging
+        rng = curr_candle['high'] - curr_candle['low'] if curr_candle['high'] != curr_candle['low'] else 1
+        lower_wick_pct = ((min(curr_candle['open'], curr_candle['close']) - curr_candle['low']) / rng) * 100
         
-        # Check time filter
+        # Check conditions
+        prev_red = prev_candle['close'] < prev_candle['open']
+        curr_green = curr_candle['close'] > curr_candle['open']
         in_window = self.strategy._in_trading_window(curr_candle['timestamp'])
-        self.trading_logger.log_time_filter(curr_candle['timestamp'], in_window)
+        
+        # Calculate EMA check
+        above_ema = True
+        if self.strategy.use_ema_filter:
+            df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+            df_sorted['ema_7'] = df_sorted['close'].ewm(span=7, adjust=False).mean()
+            above_ema = curr_candle['close'] > df_sorted.iloc[-2]['ema_7']
         
         # Use the strategy's check method
         trade = self.strategy.check_live_signal(df, stock="NIFTY")
+        
+        # Determine reason for no signal
+        reason = ""
+        if not prev_red:
+            reason = "prev candle not red"
+        elif not curr_green:
+            reason = "curr candle not green"
+        elif lower_wick_pct <= 50:
+            reason = f"wick {lower_wick_pct:.0f}% < 50%"
+        elif not in_window:
+            reason = "outside trading window"
+        elif not above_ema:
+            reason = "below EMA(7)"
+        elif not trade:
+            reason = "pin bar criteria not met"
+        
+        # Log result
+        is_valid = trade is not None
+        self.trading_logger.log_pin_bar_result(is_valid, in_window, above_ema, lower_wick_pct, reason)
         
         if trade:
             # Check if this is a new signal (not the same candle as before)
             if self.last_signal_time == trade.entry_time:
                 self.logger.debug("Signal already processed for this candle")
-                self.trading_logger.log_decision(False, "Signal already processed for this candle")
                 return None
-            
             self.last_signal_time = trade.entry_time
-            self.trading_logger.log_decision(True)
-        else:
-            reason = "Pin bar criteria not met" if not is_pin_bar else "Outside trading window" if not in_window else "Other filter failed"
-            self.trading_logger.log_decision(False, reason)
         
         return trade
     
@@ -267,25 +281,14 @@ class LiveTrader:
         # Check if we already have an active trade
         if self.active_trade:
             self.logger.warning("Already have an active trade, skipping new signal")
-            self.trading_logger.log_decision(False, "Already have an active trade")
             return
         
-        self.logger.info("=" * 60)
-        self.logger.info(f"🚀 EXECUTING TRADE")
-        self.logger.info(f"   Entry Price: {trade.entry_price:.2f}")
-        self.logger.info(f"   Stop Loss:   {trade.stop_loss:.2f}")
-        self.logger.info(f"   Take Profit: {trade.take_profit:.2f}")
-        self.logger.info(f"   Risk:        {trade.risk_per_trade:.2f} points")
-        self.logger.info(f"   Reward:      {trade.reward_per_trade:.2f} points")
-        self.logger.info("=" * 60)
-        
-        # Log trade entry to trading log
-        self.trading_logger.log_trade_entry(
-            entry_price=trade.entry_price,
-            stop_loss=trade.stop_loss,
-            take_profit=trade.take_profit,
-            risk=trade.risk_per_trade,
-            reward=trade.reward_per_trade
+        # Log trade signal to journal
+        self.trading_logger.log_trade_signal(
+            entry=trade.entry_price,
+            sl=trade.stop_loss,
+            tp=trade.take_profit,
+            risk=trade.risk_per_trade
         )
         
         # Place bracket order (entry + SL + TP)
@@ -298,10 +301,13 @@ class LiveTrader:
             transaction_type=TransactionType.BUY
         )
         
-        # Log results
+        # Log order results to journal
         for order_type, response in results.items():
-            status = "✅" if response.success else "❌"
-            self.logger.info(f"{status} {order_type.upper()}: {response.message} (ID: {response.order_id})")
+            self.trading_logger.log_order_status(
+                order_type.upper(), 
+                response.success, 
+                response.order_id or ""
+            )
         
         # Track trade
         if results.get("entry", {}).success:
@@ -314,16 +320,15 @@ class LiveTrader:
     
     def run_once(self):
         """Run one iteration of the trading loop."""
-        # Log check start
-        check_time = datetime.now()
-        self.trading_logger.log_check_start(check_time)
-        self.trading_logger.log_market_status(self.is_market_hours(), check_time)
+        # Check market status
+        if not self.is_market_hours():
+            self.trading_logger.log_market_status(False)
+            return
         
         # Fetch latest candles
         df = self.fetch_latest_candles()
         
         if df is None:
-            self.trading_logger.log_check_end()
             return
         
         if self.test_mode:
@@ -347,10 +352,6 @@ class LiveTrader:
             trade = self.check_for_signal(df)
             if trade:
                 self.execute_trade(trade)
-        
-        # Log check end with next check time
-        next_check = check_time + timedelta(seconds=self.check_interval)
-        self.trading_logger.log_check_end(next_check)
     
     def run(self):
         """Main trading loop."""
