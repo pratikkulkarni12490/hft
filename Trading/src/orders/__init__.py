@@ -126,6 +126,10 @@ class OrderPlacer:
         )
         
         return results
+    
+    def get_paper_trades(self):
+        """Get list of paper trades placed in this session."""
+        return self.paper_trades
 
 
 # Current NIFTY Futures contract

@@ -41,7 +41,7 @@ sys.path.insert(0, str(assignment_dir))
 
 from src.data import CandleDataFetcher, NIFTY_INDEX_KEY
 from src.strategy import PinBarStrategy, Trade
-from src.orders import OrderPlacer, TransactionType, NIFTY_FUTURES_CURRENT
+from src.orders import OrderPlacer, TransactionType, NIFTY_FUTURES
 from src.utils import Logger, get_trading_logger
 
 # Import from UpstoxAuth module
@@ -50,7 +50,7 @@ from UpstoxAuth.src.auth import TokenManager
 
 
 # Configuration
-NIFTY_FUTURES_KEY = NIFTY_FUTURES_CURRENT  # Update this for current month contract
+NIFTY_FUTURES_KEY = NIFTY_FUTURES  # Current month contract
 CANDLE_INTERVAL = 5  # 5-minute candles
 DEFAULT_CHECK_INTERVAL = 60  # seconds
 DEFAULT_QUANTITY = 1  # Number of lots
@@ -193,7 +193,7 @@ class LiveTrader:
                     self.logger.info(f"[TEST] Fetched {len(df)} historical candles (last 7 days)")
             else:
                 # In live mode, use intraday API
-                df = self.data_fetcher.get_nifty_index_intraday(
+                df = self.data_fetcher.get_nifty_intraday(
                     interval=CANDLE_INTERVAL
                 )
             
@@ -294,11 +294,10 @@ class LiveTrader:
         # Place bracket order (entry + SL + TP)
         results = self.order_placer.place_bracket_order(
             instrument_token=NIFTY_FUTURES_KEY,
-            quantity=self.quantity,
+            lots=self.quantity,
             entry_price=trade.entry_price,
             stop_loss=trade.stop_loss,
-            take_profit=trade.take_profit,
-            transaction_type=TransactionType.BUY
+            take_profit=trade.take_profit
         )
         
         # Log order results to journal

@@ -87,19 +87,34 @@ class CandleDataFetcher:
     def get_nifty_intraday(self, interval: int = 5) -> Optional[pd.DataFrame]:
         """Fetch NIFTY 50 Index intraday candles for today."""
         encoded_key = quote(NIFTY_INDEX_KEY, safe='')
-        url = f"{self.base_url}/intraday-candle/{encoded_key}/minutes/{interval}"
+        
+        # Try v2 API first (more reliable for intraday)
+        url = f"https://api.upstox.com/v2/market-quote/ohlc?instrument_key={encoded_key}&interval={interval}minute"
         
         try:
             resp = requests.get(url, headers=self.headers, timeout=10)
+            self.logger.debug(f"Intraday API response: {resp.status_code}")
+            
+            if resp.status_code == 404:
+                # Fallback: Use historical data for today
+                self.logger.info("Intraday API not available, using historical data")
+                today = datetime.now()
+                return self.get_candles(NIFTY_INDEX_KEY, interval, "minutes", today, today - timedelta(days=1))
+            
             if resp.status_code != 200:
-                self.logger.warning(f"Failed to fetch intraday data: {resp.status_code}")
-                return None
+                self.logger.warning(f"Failed to fetch intraday data: {resp.status_code} - {resp.text[:200]}")
+                # Fallback to historical
+                today = datetime.now()
+                return self.get_candles(NIFTY_INDEX_KEY, interval, "minutes", today, today - timedelta(days=1))
             
             data = resp.json()
             candles = data.get("data", {}).get("candles", [])
             
             if not candles:
-                return None
+                # Fallback to historical
+                self.logger.info("No intraday candles, using historical data")
+                today = datetime.now()
+                return self.get_candles(NIFTY_INDEX_KEY, interval, "minutes", today, today - timedelta(days=1))
             
             df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -110,6 +125,8 @@ class CandleDataFetcher:
         
         except Exception as e:
             self.logger.error(f"Error fetching intraday: {str(e)}")
-            return None
+            # Fallback to historical
+            today = datetime.now()
+            return self.get_candles(NIFTY_INDEX_KEY, interval, "minutes", today, today - timedelta(days=1))
 
 
