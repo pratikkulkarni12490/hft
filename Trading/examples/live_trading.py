@@ -42,7 +42,7 @@ sys.path.insert(0, str(assignment_dir))
 from src.data import CandleDataFetcher, NIFTY_INDEX_KEY
 from src.strategy import PinBarStrategy, Trade
 from src.orders import OrderPlacer, TransactionType, NIFTY_FUTURES_CURRENT
-from src.utils import Logger
+from src.utils import Logger, get_trading_logger
 
 # Import from UpstoxAuth module
 from UpstoxAuth.src.config import Config, Credentials
@@ -81,6 +81,7 @@ class LiveTrader:
         self.quantity = quantity
         self.test_mode = test_mode
         self.logger = Logger.get()
+        self.trading_logger = get_trading_logger()  # Detailed trading logs
         
         # Initialize components
         self._init_auth()
@@ -99,6 +100,10 @@ class LiveTrader:
         self.logger.info(f"Trading: {NIFTY_FUTURES_KEY}")
         self.logger.info(f"Check interval: {check_interval} seconds")
         self.logger.info(f"Quantity: {quantity} lots ({quantity * 25} units)")
+        
+        # Log session start to trading log file
+        self.trading_logger.log_session_start(mode, NIFTY_INDEX_KEY)
+        self.logger.info(f"📁 Trading logs: {self.trading_logger.get_log_file_path()}")
     
     def _init_auth(self):
         """Initialize authentication using TokenManager."""
@@ -194,13 +199,16 @@ class LiveTrader:
             
             if df is None or df.empty:
                 self.logger.warning("No candle data received")
+                self.trading_logger.log_error("No candle data received from API")
                 return None
             
             self.logger.debug(f"Fetched {len(df)} candles, latest: {df.iloc[-1]['timestamp']}")
+            self.trading_logger.log_candles_fetched(df, len(df))
             return df
             
         except Exception as e:
             self.logger.error(f"Error fetching candles: {e}")
+            self.trading_logger.log_error(f"Error fetching candles: {e}")
             return None
     
     def check_for_signal(self, df) -> Trade:
@@ -210,19 +218,43 @@ class LiveTrader:
             Trade object if signal detected, None otherwise.
         """
         if df is None or len(df) < 3:
+            self.trading_logger.log_decision(False, "Insufficient candles (need at least 3)")
             return None
         
-        # Use check_for_forming_candle to exclude the currently forming candle
-        # This ensures we only trade on confirmed/closed candles
-        trade = self.strategy.check_for_forming_candle(df, stock="NIFTY")
+        # Get the candles for analysis (excluding the forming candle)
+        df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+        prev_candle = df_sorted.iloc[-3].to_dict()
+        curr_candle = df_sorted.iloc[-2].to_dict()
+        
+        # Calculate EMA if available
+        ema_value = None
+        if self.strategy.use_ema_filter:
+            df_with_ema = df_sorted.copy()
+            df_with_ema['ema_7'] = df_with_ema['close'].ewm(span=7, adjust=False).mean()
+            ema_value = df_with_ema.iloc[-2]['ema_7']
+        
+        # Log detailed analysis
+        is_pin_bar = self.trading_logger.log_pin_bar_analysis(prev_candle, curr_candle, ema_value)
+        
+        # Check time filter
+        in_window = self.strategy._in_trading_window(curr_candle['timestamp'])
+        self.trading_logger.log_time_filter(curr_candle['timestamp'], in_window)
+        
+        # Use the strategy's check method
+        trade = self.strategy.check_live_signal(df, stock="NIFTY")
         
         if trade:
             # Check if this is a new signal (not the same candle as before)
             if self.last_signal_time == trade.entry_time:
                 self.logger.debug("Signal already processed for this candle")
+                self.trading_logger.log_decision(False, "Signal already processed for this candle")
                 return None
             
             self.last_signal_time = trade.entry_time
+            self.trading_logger.log_decision(True)
+        else:
+            reason = "Pin bar criteria not met" if not is_pin_bar else "Outside trading window" if not in_window else "Other filter failed"
+            self.trading_logger.log_decision(False, reason)
         
         return trade
     
@@ -235,6 +267,7 @@ class LiveTrader:
         # Check if we already have an active trade
         if self.active_trade:
             self.logger.warning("Already have an active trade, skipping new signal")
+            self.trading_logger.log_decision(False, "Already have an active trade")
             return
         
         self.logger.info("=" * 60)
@@ -245,6 +278,15 @@ class LiveTrader:
         self.logger.info(f"   Risk:        {trade.risk_per_trade:.2f} points")
         self.logger.info(f"   Reward:      {trade.reward_per_trade:.2f} points")
         self.logger.info("=" * 60)
+        
+        # Log trade entry to trading log
+        self.trading_logger.log_trade_entry(
+            entry_price=trade.entry_price,
+            stop_loss=trade.stop_loss,
+            take_profit=trade.take_profit,
+            risk=trade.risk_per_trade,
+            reward=trade.reward_per_trade
+        )
         
         # Place bracket order (entry + SL + TP)
         results = self.order_placer.place_bracket_order(
@@ -272,10 +314,16 @@ class LiveTrader:
     
     def run_once(self):
         """Run one iteration of the trading loop."""
+        # Log check start
+        check_time = datetime.now()
+        self.trading_logger.log_check_start(check_time)
+        self.trading_logger.log_market_status(self.is_market_hours(), check_time)
+        
         # Fetch latest candles
         df = self.fetch_latest_candles()
         
         if df is None:
+            self.trading_logger.log_check_end()
             return
         
         if self.test_mode:
@@ -299,6 +347,10 @@ class LiveTrader:
             trade = self.check_for_signal(df)
             if trade:
                 self.execute_trade(trade)
+        
+        # Log check end with next check time
+        next_check = check_time + timedelta(seconds=self.check_interval)
+        self.trading_logger.log_check_end(next_check)
     
     def run(self):
         """Main trading loop."""
@@ -339,11 +391,14 @@ class LiveTrader:
         self.logger.info("📊 TRADING SESSION SUMMARY")
         self.logger.info("=" * 60)
         
-        self.logger.info(f"Total signals detected: {len(self.trades_today)}")
+        total_signals = len(self.trades_today)
+        self.logger.info(f"Total signals detected: {total_signals}")
         
+        trades_executed = 0
         if self.paper_trading:
             paper_trades = self.order_placer.get_paper_trades()
-            self.logger.info(f"Paper orders placed: {len(paper_trades)}")
+            trades_executed = len(paper_trades)
+            self.logger.info(f"Paper orders placed: {trades_executed}")
             
             if paper_trades:
                 self.logger.info("\nPaper Trade Details:")
@@ -354,6 +409,10 @@ class LiveTrader:
                     )
         
         self.logger.info("=" * 60)
+        self.logger.info(f"📁 Trading logs saved to: {self.trading_logger.get_log_file_path()}")
+        
+        # Log session end to trading log
+        self.trading_logger.log_session_end(total_signals, trades_executed)
 
 
 def main():

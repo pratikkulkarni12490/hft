@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+from .trading_logger import TradingLogger, get_trading_logger
+
 
 class Logger:
     """Centralized logging configuration."""
